@@ -53,6 +53,46 @@ block_size_dict = {
     0x19: 128,
 }
 
+
+def mfd_total_sectors(total_blocks: int) -> int:
+    """Number of sectors for a given total block count (MIFARE Classic Mini/1K/2K/4K)."""
+    sectors = 0
+    counted = 0
+    while counted < total_blocks:
+        size = get_block_size_by_sector(sectors)
+        if size == 0:
+            break
+        counted += size
+        sectors += 1
+    return sectors
+
+
+def parse_sector_spec(spec, max_sectors: int):
+    """Parse a sector selection like 'all', '0,2,5-8' into a sorted list of ints."""
+    if spec is None or str(spec).strip().lower() in ("", "all", "*"):
+        return list(range(max_sectors))
+    selected = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            lo, hi = int(lo_s), int(hi_s)
+            if lo > hi:
+                lo, hi = hi, lo
+            selected.update(range(lo, hi + 1))
+        else:
+            selected.add(int(part))
+    invalid = sorted(s for s in selected if s < 0 or s >= max_sectors)
+    if invalid:
+        raise ArgsParserError(
+            f"Sector(s) out of range (card has {max_sectors} sectors): "
+            + ",".join(str(s) for s in invalid)
+        )
+    return sorted(selected)
+
+
 default_cwd = Path.cwd() / Path(__file__).with_name("bin")
 
 
@@ -1790,6 +1830,237 @@ class HfMfDump(DeviceRequiredUnit):
                         bin_file.write(bytes.fromhex(block_data))
         else:
             print(f"{CR}Not MiFare Classic{C0}")
+
+
+@hf_mf.command("dumpmfd")
+class HfMfDumpMfd(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Dump a live Mifare Classic card into a .mfd file, using the keys stored "
+            "in the sector trailers of an existing .mfd file. The output .mfd keeps "
+            "the freshly read card data together with the matching keys, so it stays "
+            "a complete, restorable dump."
+        )
+        parser.add_argument(
+            "-f", "--file", metavar="<file.mfd>", required=True,
+            help="Input .mfd whose sector-trailer keys are used to read the card",
+        )
+        parser.add_argument(
+            "-s", "--sectors", metavar="<spec>", required=False, default="all",
+            help="Sectors to dump: 'all' (default), or a list/range like 0,2,5-8",
+        )
+        parser.add_argument(
+            "-o", "--output", metavar="<file.mfd>", required=False, default=None,
+            help="Output .mfd path (default: hf-mf-<UID>-dump.mfd)",
+        )
+        return parser
+
+    @staticmethod
+    def _split_blocks(raw: bytes):
+        return [bytearray(raw[i:i + 16]) for i in range(0, len(raw), 16)]
+
+    @staticmethod
+    def _keys_from_trailer(trailer):
+        return bytes(trailer[0:6]), bytes(trailer[10:16])
+
+    def _read_block_with_keys(self, block, key_a, key_b):
+        """Try Key A then Key B. Returns (data16: bytes, used: 'A'/'B') or (None, None)."""
+        for key, ktype, used in (
+            (key_a, MfcKeyType.A, "A"),
+            (key_b, MfcKeyType.B, "B"),
+        ):
+            resp = self.cmd.mf1_read_one_block(block, ktype, key)
+            if resp is not None and resp.parsed is not None and len(resp.parsed) >= 16:
+                return bytes(resp.parsed[:16]), used
+        return None, None
+
+    def _print_block(self, block, data, uid, trailer=False):
+        h = bytes(data).hex().upper()
+        if block == 0:
+            print(f"{block:03d}: {CY}{h[0:8]}{C0}{h[8:]}")
+        elif trailer:
+            print(f"{block:03d}: {CG}{h[0:12]}{CR}{h[12:20]}{CG}{h[20:]}{C0}")
+        else:
+            print(f"{block:03d}: {h}")
+
+    def on_exec(self, args: argparse.Namespace):
+        path = args.file
+        if not os.path.exists(path):
+            print(f"{CR}Input file not found: {path}{C0}")
+            return
+        with open(path, "rb") as f:
+            raw = f.read()
+        if len(raw) == 0 or len(raw) % 16 != 0:
+            print(f"{CR}Not a valid .mfd (size {len(raw)} bytes, must be a multiple of 16){C0}")
+            return
+        src_blocks = self._split_blocks(raw)
+        total_blocks = len(src_blocks)
+        max_sectors = mfd_total_sectors(total_blocks)
+        try:
+            sectors = parse_sector_spec(args.sectors, max_sectors)
+        except ArgsParserError as e:
+            print(f"{CR}{e}{C0}")
+            return
+        print(f"Input  : {path} ({total_blocks} blocks, {max_sectors} sectors)")
+        print(f"Sectors: {CY}{','.join(str(s) for s in sectors)}{C0}")
+
+        scan = self.cmd.hf_14a_scan()
+        if scan is None or len(scan) == 0:
+            print(f"{CR}No tag found{C0}")
+            return
+        uid = scan[0]["uid"]
+        print(f"UID    : {uid.hex().upper()}  SAK: {scan[0]['sak'].hex().upper()}")
+
+        out_blocks = [bytearray(b) for b in src_blocks]
+        read_ok = 0
+        read_fail = []
+        for sector in sectors:
+            first = get_block_index_by_sector(sector)
+            nblk = get_block_size_by_sector(sector)
+            trailer_idx = first + nblk - 1
+            key_a, key_b = self._keys_from_trailer(src_blocks[trailer_idx])
+            print(
+                f"\n{CM}Sector {sector:02d}{C0} (blocks {first}-{trailer_idx})  "
+                f"KeyA={key_a.hex().upper()} KeyB={key_b.hex().upper()}"
+            )
+            for block in range(first, trailer_idx):
+                data, used = self._read_block_with_keys(block, key_a, key_b)
+                if data is not None:
+                    out_blocks[block] = bytearray(data)
+                    read_ok += 1
+                    self._print_block(block, data, uid)
+                    print(f"      (key {used})")
+                else:
+                    read_fail.append(block)
+                    print(f"{block:03d}: {CR}read failed - keeping source data{C0}")
+            # Trailer: keep the known keys, use the card's real access bits if readable
+            t_read, _ = self._read_block_with_keys(trailer_idx, key_a, key_b)
+            if t_read is not None:
+                access = t_read[6:10]
+                read_ok += 1
+            else:
+                access = bytes(src_blocks[trailer_idx][6:10])
+            out_blocks[trailer_idx] = bytearray(key_a + access + key_b)
+            self._print_block(trailer_idx, out_blocks[trailer_idx], uid, trailer=True)
+
+        out_path = args.output or f"hf-mf-{uid.hex().upper()}-dump.mfd"
+        base, ext = os.path.splitext(out_path)
+        idx = 1
+        while os.path.exists(out_path):
+            out_path = f"{base}-{idx}{ext}"
+            idx += 1
+        with open(out_path, "wb") as f:
+            for b in out_blocks:
+                f.write(bytes(b))
+        print(f"\n{CG}Saved {len(out_blocks) * 16} bytes to {out_path}{C0}  "
+              f"({read_ok} block(s) read from card)")
+        if read_fail:
+            print(f"{CR}{len(read_fail)} block(s) could not be read (source data kept): "
+                  f"{','.join(str(b) for b in read_fail)}{C0}")
+
+
+@hf_mf.command("dumptxt")
+class HfMfDumpTxt(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = (
+            "Read a whole Mifare Classic card with a list of keys and write the "
+            "result to a human-readable .txt file, grouped by sector."
+        )
+        parser.add_argument(
+            "-k", "--keys", metavar="<file>", type=argparse.FileType("r"), required=True,
+            help="Key file: one 12-HEX key per line",
+        )
+        parser.add_argument(
+            "-o", "--output", metavar="<file.txt>", required=False, default=None,
+            help="Output .txt path (default: hf-mf-<UID>-dump.txt)",
+        )
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        valid_keys = []
+        with open(args.keys.name, "r") as kf:
+            for line in kf:
+                k = line.strip()
+                if re.match(r"^[a-fA-F0-9]{12}$", k):
+                    valid_keys.append(k.upper())
+        seen = set()
+        valid_keys = [k for k in valid_keys if not (k in seen or seen.add(k))]
+        if not valid_keys:
+            print(f"{CR}No valid 12-HEX keys found in key file{C0}")
+            return
+        print(f"Total keys: {CR}{len(valid_keys)}{C0}")
+
+        scan = self.cmd.hf_14a_scan()
+        if scan is None or len(scan) == 0:
+            print(f"{CR}No tag found{C0}")
+            return
+        uid = scan[0]["uid"]
+        atqa = scan[0]["atqa"]
+        sak = scan[0]["sak"]
+        sak_int = int.from_bytes(sak, "big")
+        print(f"UID: {uid.hex().upper()}  ATQA: {atqa.hex().upper()}  SAK: {sak.hex().upper()}")
+        if sak_int not in block_size_dict:
+            print(f"{CR}Not Mifare Classic (SAK {sak.hex().upper()}){C0}")
+            return
+        total_blocks = block_size_dict[sak_int]
+        max_sectors = mfd_total_sectors(total_blocks)
+        card_type = type_id_SAK_dict.get(sak_int, "Unknown")
+        time.sleep(0.3)
+
+        block_data = {}
+        block_key = {}
+        for block in range(total_blocks):
+            for key in valid_keys:
+                resp = self.cmd.mf1_read_block(block, bytes.fromhex(key))
+                if resp is not None and resp.parsed is not None and len(resp.parsed) >= 16:
+                    block_data[block] = resp.parsed.hex().upper()
+                    used = "A" if self.cmd.mf1_authenticated_useKeyA else "B"
+                    block_key[block] = (key, used)
+                    print(f"\r{' ' * 70}", end="\r")
+                    print(f"{block:03d}: {block_data[block]}  (key {used} {key})")
+                    valid_keys.insert(0, valid_keys.pop(valid_keys.index(key)))
+                    break
+                else:
+                    print(f"\rBlock {block} key {valid_keys.index(key) + 1}/{len(valid_keys)}", end="\r")
+
+        out_path = args.output or f"hf-mf-{uid.hex().upper()}-dump.txt"
+        base, ext = os.path.splitext(out_path)
+        idx = 1
+        while os.path.exists(out_path):
+            out_path = f"{base}-{idx}{ext}"
+            idx += 1
+        lines = [
+            "Mifare Classic dump",
+            f"Date   : {datetime.now().isoformat(timespec='seconds')}",
+            f"UID    : {uid.hex().upper()}",
+            f"ATQA   : {atqa.hex().upper()}",
+            f"SAK    : {sak.hex().upper()}",
+            f"Type   : {card_type}",
+            f"Blocks : {len(block_data)}/{total_blocks} read",
+            "",
+        ]
+        for sector in range(max_sectors):
+            first = get_block_index_by_sector(sector)
+            nblk = get_block_size_by_sector(sector)
+            trailer_idx = first + nblk - 1
+            lines.append(f"--- Sector {sector:02d}  (blocks {first}-{trailer_idx}) ---")
+            for block in range(first, trailer_idx + 1):
+                if block in block_data:
+                    tag = ""
+                    if block in block_key:
+                        tag = f"   key {block_key[block][1]} {block_key[block][0]}"
+                    label = " [trailer]" if block == trailer_idx else ""
+                    lines.append(f"{block:03d}: {block_data[block]}{label}{tag}")
+                else:
+                    lines.append(f"{block:03d}: --unreadable--")
+            lines.append("")
+        with open(out_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"\n{CG}Text dump saved to {out_path}  "
+              f"({len(block_data)}/{total_blocks} blocks){C0}")
+
 
 @hf_mf.command("wipe")
 class HfMfWipe(DeviceRequiredUnit):
