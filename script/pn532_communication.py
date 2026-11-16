@@ -80,7 +80,11 @@ class SerialCommunication(CommunicationInterface):
     
     def read(self, size: int = 1) -> bytes:
         if self.serial_instance:
-            return self.serial_instance.read(size)
+            # Don't block waiting for `size` bytes: pyserial's read(n) waits for the
+            # full timeout unless n bytes arrive, which added ~100ms to every PN532
+            # response. Return whatever is already buffered, or wait for 1 byte.
+            waiting = self.serial_instance.in_waiting
+            return self.serial_instance.read(min(waiting, size) if waiting else 1)
         return b''
     
     def set_timeout(self, timeout: float) -> None:

@@ -1793,10 +1793,15 @@ class HfMfDump(DeviceRequiredUnit):
             print(f"Block Size: {block_size}")
             time.sleep(0.5)
             dump_map = {}
+            self.cmd.mf1_reset_auth()
+            dead_sectors = set()
             for block in range(block_size):
+                sector = block // 4 if block < 128 else ((block - 128) // 16 + 32)
+                if sector in dead_sectors:
+                    continue
                 for key in valid_keys:
                     resp = self.cmd.mf1_read_block(block, bytes.fromhex(key))
-                    if resp and resp.parsed:
+                    if resp and resp.parsed and len(resp.parsed) >= 16:
                         # print line with space * 60
                         print(f"\r{' '*60}", end="\r")
                         dump_map[block] = resp.parsed.hex().upper()
@@ -1821,6 +1826,13 @@ class HfMfDump(DeviceRequiredUnit):
                         break
                     else:
                         print(f"\rAuth block {block} with key {key} ({valid_keys.index(key) + 1}/{len(valid_keys)})", end="\r")
+                else:
+                    # No key opened this block; if nothing in the sector was readable,
+                    # the remaining blocks would fail the same way - skip them.
+                    first = (sector * 4) if sector < 32 else (128 + (sector - 32) * 16)
+                    if not any(b in dump_map for b in range(first, block)):
+                        dead_sectors.add(sector)
+                        print(f"\r{' '*60}\r{CR}Sector {sector}: no valid key, skipped{C0}")
             if args.file:
                 with open(f"mf_dump_{uid.hex().upper()}.json", "w") as json_file:
                     json.dump({"blocks": dump_map}, json_file)
@@ -1864,16 +1876,36 @@ class HfMfDumpMfd(DeviceRequiredUnit):
     def _keys_from_trailer(trailer):
         return bytes(trailer[0:6]), bytes(trailer[10:16])
 
-    def _read_block_with_keys(self, block, key_a, key_b):
-        """Try Key A then Key B. Returns (data16: bytes, used: 'A'/'B') or (None, None)."""
+    def _read_sector_with_keys(self, blocks, key_a, key_b):
+        """Read `blocks` (all in one sector) authenticating once per key instead of
+        once per block. Returns {block: (data16, 'A'/'B')}."""
+        result = {}
+        pending = list(blocks)
         for key, ktype, used in (
             (key_a, MfcKeyType.A, "A"),
             (key_b, MfcKeyType.B, "B"),
         ):
-            resp = self.cmd.mf1_read_one_block(block, ktype, key)
-            if resp is not None and resp.parsed is not None and len(resp.parsed) >= 16:
-                return bytes(resp.parsed[:16]), used
-        return None, None
+            if not pending:
+                break
+            if not self.cmd.mf1_auth_block(pending[0], ktype, key):
+                continue
+            still = []
+            authed = True
+            for block in pending:
+                if not authed:
+                    authed = self.cmd.mf1_auth_block(block, ktype, key)
+                    if not authed:
+                        still.append(block)
+                        continue
+                data = self.cmd.mf1_read_raw(block)
+                if data is not None:
+                    result[block] = (data, used)
+                else:
+                    # Refused read halts the card; re-auth before the next block
+                    still.append(block)
+                    authed = False
+            pending = still
+        return result
 
     def _print_block(self, block, data, uid, trailer=False):
         h = bytes(data).hex().upper()
@@ -1924,9 +1956,12 @@ class HfMfDumpMfd(DeviceRequiredUnit):
                 f"\n{CM}Sector {sector:02d}{C0} (blocks {first}-{trailer_idx})  "
                 f"KeyA={key_a.hex().upper()} KeyB={key_b.hex().upper()}"
             )
+            sector_data = self._read_sector_with_keys(
+                range(first, trailer_idx + 1), key_a, key_b
+            )
             for block in range(first, trailer_idx):
-                data, used = self._read_block_with_keys(block, key_a, key_b)
-                if data is not None:
+                if block in sector_data:
+                    data, used = sector_data[block]
                     out_blocks[block] = bytearray(data)
                     read_ok += 1
                     self._print_block(block, data, uid)
@@ -1935,9 +1970,8 @@ class HfMfDumpMfd(DeviceRequiredUnit):
                     read_fail.append(block)
                     print(f"{block:03d}: {CR}read failed - keeping source data{C0}")
             # Trailer: keep the known keys, use the card's real access bits if readable
-            t_read, _ = self._read_block_with_keys(trailer_idx, key_a, key_b)
-            if t_read is not None:
-                access = t_read[6:10]
+            if trailer_idx in sector_data:
+                access = sector_data[trailer_idx][0][6:10]
                 read_ok += 1
             else:
                 access = bytes(src_blocks[trailer_idx][6:10])
@@ -2011,7 +2045,12 @@ class HfMfDumpTxt(DeviceRequiredUnit):
 
         block_data = {}
         block_key = {}
+        self.cmd.mf1_reset_auth()
+        dead_sectors = set()
         for block in range(total_blocks):
+            sector = block // 4 if block < 128 else ((block - 128) // 16 + 32)
+            if sector in dead_sectors:
+                continue
             for key in valid_keys:
                 resp = self.cmd.mf1_read_block(block, bytes.fromhex(key))
                 if resp is not None and resp.parsed is not None and len(resp.parsed) >= 16:
@@ -2024,6 +2063,11 @@ class HfMfDumpTxt(DeviceRequiredUnit):
                     break
                 else:
                     print(f"\rBlock {block} key {valid_keys.index(key) + 1}/{len(valid_keys)}", end="\r")
+            else:
+                first = get_block_index_by_sector(sector)
+                if not any(b in block_data for b in range(first, block)):
+                    dead_sectors.add(sector)
+                    print(f"\r{' ' * 70}\r{CR}Sector {sector}: no valid key, skipped{C0}")
 
         out_path = args.output or f"hf-mf-{uid.hex().upper()}-dump.txt"
         base, ext = os.path.splitext(out_path)

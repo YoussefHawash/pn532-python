@@ -41,8 +41,9 @@ class Pn532CMD:
         self.device = pn532
 
     @expect_response(Status.SUCCESS)
-    def hf_14a_scan(self):
-        self.device.set_normal_mode()
+    def hf_14a_scan(self, normal_mode=True):
+        if normal_mode:
+            self.device.set_normal_mode()
         """
         14a tags in the scanning field.
 
@@ -429,21 +430,50 @@ class Pn532CMD:
     mf1_authenticated_sector = -1
     mf1_authenticated_useKeyA = True
 
+    def mf1_reset_auth(self):
+        """Forget the cached authenticated sector (call before a new card/dump)."""
+        self.mf1_authenticated_sector = -1
+        self.mf1_authenticated_useKeyA = True
+
+    def _mf1_reselect_uid(self):
+        """Re-select the tag after a failed auth/read (card drops to IDLE).
+        Skips set_normal_mode: the PN532 is already awake mid-session."""
+        resp = self.hf_14a_scan(normal_mode=False)
+        if resp == None or len(resp) == 0:
+            return None
+        return bytes(resp[0]["uid"])
+
+    def mf1_auth_block(self, block, type_value: MfcKeyType, key) -> bool:
+        """Re-select the tag and authenticate the sector containing `block`."""
+        uid = self._mf1_reselect_uid()
+        if uid is None:
+            return False
+        return self.mf1_auth_one_key_block(block, type_value, key, uid)
+
+    def mf1_read_raw(self, block):
+        """Read a block in the currently authenticated sector. Returns 16 bytes or None."""
+        data = struct.pack("!BBB", 0x01, MifareCommand.MfReadBlock, block)
+        resp = self.device.send_cmd_sync(Command.InDataExchange, data)
+        if resp.data is not None and len(resp.data) >= 16:
+            return bytes(resp.data[:16])
+        return None
+
     def mf1_read_block(self, block, key):
         current_sector = block // 4 if block < 128 else ((block - 128) // 16 + 32)
         if self.mf1_authenticated_sector != current_sector:
-            resp = self.hf_14a_scan()
-            if resp == None:
+            uidID1 = self._mf1_reselect_uid()
+            if uidID1 is None:
                 print("No tag found")
-                return resp
-            uidID1 = bytes(resp[0]["uid"])
+                return None
             auth_result = self.mf1_auth_one_key_block(block, MfcKeyType.A, key, uidID1)
+            self.mf1_authenticated_useKeyA = True
             if not auth_result:
                 self.mf1_authenticated_useKeyA = False
-                resp = self.hf_14a_scan()
-                auth_result = self.mf1_auth_one_key_block(block, MfcKeyType.B, key, uidID1)
+                uidID1 = self._mf1_reselect_uid()
+                if uidID1 is not None:
+                    auth_result = self.mf1_auth_one_key_block(block, MfcKeyType.B, key, uidID1)
             if not auth_result:
-                self.mf1_authenticated_useKeyA = True
+                self.mf1_reset_auth()
                 return Response(Command.InDataExchange, Status.MF_ERR_AUTH)
             self.mf1_authenticated_sector = current_sector
 
@@ -456,14 +486,16 @@ class Pn532CMD:
                     resp.parsed = key + resp.parsed[6:]
                 else:
                     resp.parsed = resp.parsed[0:10] + key
+        else:
+            # Read refused (access bits) -> card is no longer authenticated
+            self.mf1_authenticated_sector = -1
         return resp
 
     def mf1_read_one_block(self, block, type_value: MfcKeyType, key):
-        resp = self.hf_14a_scan()
-        if resp == None:
+        uidID1 = self._mf1_reselect_uid()
+        if uidID1 is None:
             print("No tag found")
-            return resp
-        uidID1 = bytes(resp[0]["uid"])
+            return None
         auth_result = self.mf1_auth_one_key_block(
             block, type_value, key, uidID1
         )
