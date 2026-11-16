@@ -366,12 +366,9 @@ class ArgumentParserNoExit(argparse.ArgumentParser):
         print(f"{CR}{self.prog}{C0}\n")
         lines = self.format_help().splitlines()
         usage = lines[:lines.index('')]
-        if usage and len(usage) > 0:
-        # If it doesn't strictly start with 'usage:', you can normalize or adjust it
-            if not usage[0].lower().startswith('usage:'):
-            # Prepend 'usage:' if missing, or adjust as needed for Python 3.14 compatibility
-                pass
-        assert usage and usage[0].lower().startswith('usage:')
+        usage = self.format_usage().splitlines()
+        if  usage and not usage[0].lower().startswith('usage:'):
+            usage[0] = 'usage: ' + usage[0]
         usage[0] = usage[0].replace('usage:', f'{CG}usage:{C0}\n ')
         usage[0] = usage[0].replace(self.prog, f'{CR}{self.prog}{C0}')
         usage = [usage[0]] + [x[4:] for x in usage[1:]] + ['']
